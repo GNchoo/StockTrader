@@ -6,7 +6,7 @@ from app.storage.db import DB
 from app.config import settings
 from app.monitor.telegram_logger import log_and_notify
 from app.signal.ingest import ingest_and_create_signal
-from app.execution.runtime import build_broker
+from app.execution.runtime import build_broker, resolve_expected_price
 from app.execution.entry import execute_signal_impl
 from app.execution.sync import sync_pending_entries_impl, sync_pending_exits_impl
 from app.execution.triggers import (
@@ -15,12 +15,29 @@ from app.execution.triggers import (
     trigger_time_exit_orders_impl,
 )
 from app.common.timeutil import parse_utc_ts
-from app.main import (
-    _build_broker,
-    _resolve_expected_price,
-    _sync_entry_order_once,
-    _sync_exit_order_once,
-)
+
+
+# --- 의존성 어댑터 (app.main의 private 함수 대신 직접 정의) ---
+def _build_broker():
+    return build_broker()
+
+
+def _resolve_expected_price(broker, ticker: str):
+    return resolve_expected_price(broker, ticker)
+
+
+def _sync_entry_order_once(db, broker, *, position_id, signal_id, order_id, ticker, qty, broker_order_id):
+    """매수 주문 체결 동기화 — app.main._sync_entry_order_once와 동일 로직"""
+    from app.main import _sync_entry_order_once as _impl
+    return _impl(db, broker, position_id=position_id, signal_id=signal_id,
+                 order_id=order_id, ticker=ticker, qty=qty, broker_order_id=broker_order_id)
+
+
+def _sync_exit_order_once(db, broker, *, position_id, signal_id, order_id, ticker, order_qty, broker_order_id):
+    """매도 주문 체결 동기화 — app.main._sync_exit_order_once와 동일 로직"""
+    from app.main import _sync_exit_order_once as _impl
+    return _impl(db, broker, position_id=position_id, signal_id=signal_id,
+                 order_id=order_id, ticker=ticker, order_qty=order_qty, broker_order_id=broker_order_id)
 
 
 def daemon_loop():

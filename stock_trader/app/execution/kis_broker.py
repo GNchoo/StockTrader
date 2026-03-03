@@ -290,7 +290,7 @@ class KISBroker(BrokerBase):
             if not closes:
                 return None
                 
-            # 가장 오래된 데이터가 배열 앞쪽에 오도독 역순 정렬
+            # 가장 오래된 데이터가 배열 앞쪽에 오도록 역순 정렬
             closes.reverse()
             return closes
         except Exception:
