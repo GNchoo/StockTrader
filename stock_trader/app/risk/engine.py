@@ -86,9 +86,12 @@ def can_trade(
             else:
                 base_now = base_now.astimezone(timezone.utc)
             cooldown_until = _parse_ts(account_state.get("cooldown_until"))
+            # cooldown_until이 None이면 쿨다운이 설정되지 않은 상태
             if cooldown_until is None:
-                cooldown_until = base_now + timedelta(minutes=p.cooldown_minutes)
-            if cooldown_until > base_now:
+                # 쿨다운이 설정되어야 하지만 아직 설정되지 않았다면 거래 허용
+                # 실제 쿨다운 설정은 apply_realized_pnl에서 처리됨
+                pass
+            elif cooldown_until > base_now:
                 return RiskDecision(False, "RISK_COOLDOWN")
 
     if current_open_positions >= p.max_concurrent_positions:

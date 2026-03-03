@@ -15,15 +15,24 @@ class SignalBundle(TypedDict):
     ticker: str
 
 
-def _load_news_item(log_and_notify) -> object:
+def _load_news_item(log_and_notify) -> object | None:
     mode = (settings.news_mode or "sample").lower()
     if mode == "rss":
         try:
             items = fetch_rss_news_items(settings.news_rss_url, limit=10)
+            # 매핑 가능한 뉴스만 필터링
+            mappable_items = []
             for n in items:
                 if map_ticker((n.title or "") + " " + (n.body or "")):
-                    return n
-            return items[0]
+                    mappable_items.append(n)
+            
+            if mappable_items:
+                # 매핑 가능한 첫 번째 뉴스 반환
+                return mappable_items[0]
+            else:
+                # 매핑 가능한 뉴스가 없으면 None 반환
+                log_and_notify("RSS_NO_MAPPABLE_NEWS")
+                return None
         except NewsFetchError as e:
             log_and_notify(f"NEWS_FETCH_FALLBACK_SAMPLE:{e}")
             return sample_news()
@@ -32,6 +41,10 @@ def _load_news_item(log_and_notify) -> object:
 
 def ingest_and_create_signal(db: DB, log_and_notify) -> SignalBundle | None:
     news = _load_news_item(log_and_notify)
+    if news is None:
+        # 매핑 가능한 뉴스가 없으면 바로 종료
+        return None
+    
     raw_hash = build_hash(news)
 
     db.begin()

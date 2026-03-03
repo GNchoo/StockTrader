@@ -19,6 +19,7 @@ class DB:
         self.path = Path(path)
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
+        self._transaction_depth = 0  # 트랜잭션 중첩 깊이 추적
 
     def __enter__(self) -> "DB":
         return self
@@ -29,13 +30,26 @@ class DB:
         self.close()
 
     def begin(self) -> None:
-        self.conn.execute("BEGIN")
+        if self._transaction_depth == 0:
+            self.conn.execute("BEGIN")
+        self._transaction_depth += 1
 
     def commit(self) -> None:
-        self.conn.commit()
+        if self._transaction_depth > 0:
+            self._transaction_depth -= 1
+            if self._transaction_depth == 0:
+                self.conn.commit()
+        else:
+            # 트랜잭션이 시작되지 않았는데 commit 호출
+            pass
 
     def rollback(self) -> None:
-        self.conn.rollback()
+        if self._transaction_depth > 0:
+            self._transaction_depth = 0
+            self.conn.rollback()
+        else:
+            # 트랜잭션이 시작되지 않았는데 rollback 호출
+            pass
 
     def close(self) -> None:
         self.conn.close()
@@ -216,7 +230,7 @@ class DB:
             """,
             (trade_date,),
         )
-        if autocommit:
+        if autocommit and self._transaction_depth == 0:
             self.conn.commit()
 
     def get_risk_state(self, trade_date: str) -> dict[str, Any] | None:
@@ -228,21 +242,57 @@ class DB:
     def apply_realized_pnl(self, trade_date: str, pnl_delta: float, autocommit: bool = True) -> None:
         self.ensure_risk_state_today(trade_date, autocommit=False)
         cur = self.conn.cursor()
-        cur.execute(
-            """
-            update risk_state
-            set daily_realized_pnl = daily_realized_pnl + ?,
-                consecutive_losses = case
-                    when ? < 0 then consecutive_losses + 1
-                    else 0
-                end,
-                updated_at = current_timestamp
-            where trade_date=?
-            """,
-            (float(pnl_delta or 0.0), float(pnl_delta or 0.0), trade_date),
-        )
-        if autocommit:
+        
+        # 먼저 현재 상태를 가져옵니다
+        cur.execute("select consecutive_losses, cooldown_until from risk_state where trade_date=?", (trade_date,))
+        row = cur.fetchone()
+        current_consecutive_losses = row["consecutive_losses"] if row else 0
+        current_cooldown_until = row["cooldown_until"] if row else None
+        
+        # 손실이면 연속 손실 증가, 수익이면 0으로 리셋
+        new_consecutive_losses = current_consecutive_losses + 1 if pnl_delta < 0 else 0
+        
+        # cooldown_until 업데이트: 연속 손실이 임계값에 도달하면 설정, 수익이면 초기화
+        if pnl_delta < 0 and new_consecutive_losses >= self._get_loss_streak_cooldown():
+            # 손실이 계속되고 임계값에 도달하면 cooldown 설정
+            cur.execute(
+                """
+                update risk_state
+                set daily_realized_pnl = daily_realized_pnl + ?,
+                    consecutive_losses = ?,
+                    cooldown_until = datetime('now', '+' || ? || ' minutes'),
+                    updated_at = current_timestamp
+                where trade_date=?
+                """,
+                (float(pnl_delta or 0.0), new_consecutive_losses, 
+                 self._get_cooldown_minutes(), trade_date),
+            )
+        else:
+            # 수익이거나 임계값 미달이면 cooldown_until 초기화
+            cur.execute(
+                """
+                update risk_state
+                set daily_realized_pnl = daily_realized_pnl + ?,
+                    consecutive_losses = ?,
+                    cooldown_until = null,
+                    updated_at = current_timestamp
+                where trade_date=?
+                """,
+                (float(pnl_delta or 0.0), new_consecutive_losses, trade_date),
+            )
+        
+        if autocommit and self._transaction_depth == 0:
             self.conn.commit()
+    
+    def _get_loss_streak_cooldown(self) -> int:
+        """리스크 설정에서 loss_streak_cooldown 값을 가져옵니다."""
+        from app.config import settings
+        return max(1, int(settings.risk_loss_streak_cooldown or 3))
+    
+    def _get_cooldown_minutes(self) -> int:
+        """리스크 설정에서 cooldown_minutes 값을 가져옵니다."""
+        from app.config import settings
+        return max(1, int(settings.risk_cooldown_minutes or 60))
 
     def get_parameter(self, name: str) -> dict[str, Any] | None:
         cur = self.conn.cursor()
@@ -323,7 +373,7 @@ class DB:
                     item["raw_hash"],
                 ),
             )
-            if autocommit:
+            if autocommit and self._transaction_depth == 0:
                 self.conn.commit()
             return int(cur.lastrowid)
         except sqlite3.IntegrityError:
@@ -346,7 +396,7 @@ class DB:
             """,
             (news_id, ticker, company_name, confidence, method),
         )
-        if autocommit:
+        if autocommit and self._transaction_depth == 0:
             self.conn.commit()
         return int(cur.lastrowid)
 
@@ -374,7 +424,7 @@ class DB:
                 payload["decision"],
             ),
         )
-        if autocommit:
+        if autocommit and self._transaction_depth == 0:
             self.conn.commit()
         return int(cur.lastrowid)
 
@@ -387,7 +437,7 @@ class DB:
             """,
             (ticker, signal_id, qty),
         )
-        if autocommit:
+        if autocommit and self._transaction_depth == 0:
             self.conn.commit()
         return int(cur.lastrowid)
 
@@ -403,7 +453,7 @@ class DB:
         )
         if cur.rowcount == 0:
             raise IllegalTransitionError(f"Invalid transition to OPEN for position_id={position_id}")
-        if autocommit:
+        if autocommit and self._transaction_depth == 0:
             self.conn.commit()
 
     def set_position_partial_exit(self, position_id: int, exited_qty: float, autocommit: bool = True) -> None:
@@ -418,7 +468,7 @@ class DB:
         )
         if cur.rowcount == 0:
             raise IllegalTransitionError(f"Invalid transition to PARTIAL_EXIT for position_id={position_id}")
-        if autocommit:
+        if autocommit and self._transaction_depth == 0:
             self.conn.commit()
 
     def update_position_high_watermark(self, position_id: int, price: float, autocommit: bool = True) -> None:
@@ -435,7 +485,7 @@ class DB:
             """,
             (price, price, price, position_id),
         )
-        if autocommit:
+        if autocommit and self._transaction_depth == 0:
             self.conn.commit()
 
     def get_position_high_watermark(self, position_id: int) -> float | None:
@@ -459,7 +509,7 @@ class DB:
         )
         if cur.rowcount == 0:
             raise IllegalTransitionError(f"Invalid transition to CLOSED for position_id={position_id}")
-        if autocommit:
+        if autocommit and self._transaction_depth == 0:
             self.conn.commit()
 
     def set_position_cancelled(self, position_id: int, reason_code: str, autocommit: bool = True) -> None:
@@ -474,7 +524,7 @@ class DB:
         )
         if cur.rowcount == 0:
             raise IllegalTransitionError(f"Invalid transition to CANCELLED for position_id={position_id}")
-        if autocommit:
+        if autocommit and self._transaction_depth == 0:
             self.conn.commit()
 
     def insert_order(
@@ -498,7 +548,7 @@ class DB:
             """,
             (position_id, signal_id, ticker, side, qty, order_type, status, price, int(attempt_no or 1)),
         )
-        if autocommit:
+        if autocommit and self._transaction_depth == 0:
             self.conn.commit()
         return int(cur.lastrowid)
 
@@ -526,7 +576,7 @@ class DB:
                 raise IllegalTransitionError(
                     f"Invalid order status transition for order_id={order_id}: {current} -> {status}"
                 )
-        if autocommit:
+        if autocommit and self._transaction_depth == 0:
             self.conn.commit()
 
     def update_order_partial(
@@ -551,7 +601,7 @@ class DB:
         )
         if cur.rowcount == 0:
             raise IllegalTransitionError(f"Invalid transition to PARTIAL_FILLED for order_id={order_id}")
-        if autocommit:
+        if autocommit and self._transaction_depth == 0:
             self.conn.commit()
 
     def update_order_filled(
@@ -577,7 +627,7 @@ class DB:
         )
         if cur.rowcount == 0:
             raise IllegalTransitionError(f"Invalid transition to FILLED for order_id={order_id}")
-        if autocommit:
+        if autocommit and self._transaction_depth == 0:
             self.conn.commit()
 
     def get_order_status(self, order_id: int) -> str | None:
@@ -720,7 +770,7 @@ class DB:
                 """,
                 (position_id, event_type, action, reason_code, detail_json, idempotency_key),
             )
-            if autocommit:
+            if autocommit and self._transaction_depth == 0:
                 self.conn.commit()
             return int(cur.lastrowid)
         except sqlite3.IntegrityError:
