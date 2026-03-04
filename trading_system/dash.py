@@ -1209,16 +1209,15 @@ class Handler(BaseHTTPRequestHandler):
             if key in existing_keys:
                 continue
 
-            # Calculate precise PNL by seeking corresponding BUY order within the UPBIT done list
+            # Calculate precise PNL by seeking corresponding BUY order within the comprehensive trade_log
             pnl = 0
             profit = 0
             if side == 'SELL':
-                for prev_o in done:
-                    p_side = 'BUY' if prev_o.get('side') == 'bid' else 'SELL'
-                    if p_side == 'BUY' and prev_o.get('market') == symbol:
-                        p_created = prev_o.get('created_at') or ''
+                for prev_t in reversed(trade_log):
+                    if prev_t.get('side') == 'BUY' and prev_t.get('symbol') == symbol:
+                        p_created = prev_t.get('date') or ''
                         if p_created < created_at:
-                            buy_price = float(prev_o.get('price') or prev_o.get('avg_price') or 0)
+                            buy_price = float(prev_t.get('price') or 0)
                             if buy_price > 0:
                                 pnl = (price - buy_price) / buy_price
                                 buy_cost = buy_price * volume
