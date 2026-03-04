@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 from agent import Agent
 from llm_client import LLMClient
@@ -21,6 +21,15 @@ memory = MemoryStore(DB_PATH)
 tools = FileTools(WORKSPACE_ROOT)
 llm = LLMClient()
 agent = Agent(llm, sessions, memory, tools)
+
+AVAILABLE_MODELS = [
+    ("auto-gemini-3", "auto-gemini-3"),
+    ("gemini-3.1-pro-preview", "3.1-pro"),
+    ("gemini-3-flash-preview", "3.0-flash"),
+    ("auto-gemini-2.5", "auto-gemini-2.5"),
+    ("gemini-2.5-pro", "2.5-pro"),
+    ("gemini-2.5-flash", "2.5-flash"),
+]
 
 
 def is_allowed(user_id: int) -> bool:
@@ -96,15 +105,14 @@ async def models_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(uid):
         return
 
+    rows = []
+    for model_id, label in AVAILABLE_MODELS:
+        rows.append([InlineKeyboardButton(label, callback_data=f"set_model:{model_id}")])
+
+    kb = InlineKeyboardMarkup(rows)
     await update.message.reply_text(
-        "현재 gemini-cli에서 사용 가능한(검증된) 모델:\n"
-        "- auto-gemini-3\n"
-        "- gemini-3.1-pro-preview\n"
-        "- gemini-3-flash-preview\n"
-        "- auto-gemini-2.5\n"
-        "- gemini-2.5-pro\n"
-        "- gemini-2.5-flash\n\n"
-        "변경 예시: /model auto-gemini-3"
+        f"모델을 선택하세요. (현재: {llm.get_model()})",
+        reply_markup=kb,
     )
 
 
@@ -124,6 +132,38 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_key = f"tg:{uid}"
     out = agent.approve_and_run(user_key, req_id)
     await update.message.reply_text(out)
+
+
+async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    uid = query.from_user.id
+    if not is_allowed(uid):
+        await query.edit_message_text("허용되지 않은 사용자입니다.")
+        return
+
+    data = query.data or ""
+    if not data.startswith("set_model:"):
+        return
+
+    new_model = data.split(":", 1)[1]
+
+    import subprocess
+    proc = subprocess.run(
+        [llm.gemini_bin, "-m", new_model, "-p", "ok"],
+        capture_output=True,
+        text=True,
+        timeout=45,
+        check=False,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "model check failed").strip()[:300]
+        await query.edit_message_text(f"❌ 모델 검증 실패: {new_model}\n{err}")
+        return
+
+    llm.set_model(new_model)
+    await query.edit_message_text(f"✅ 모델 변경 완료: {new_model}")
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -174,6 +214,7 @@ def main():
     app.add_handler(CommandHandler("model", model_cmd))
     app.add_handler(CommandHandler("models", models_cmd))
     app.add_handler(CommandHandler("approve", approve))
+    app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^set_model:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling()
 
