@@ -526,8 +526,8 @@ function render(d) {
   renderMobilePositions(d);
 
   // 테이블 렌더링 (최근 N건)
-  // UPBIT_SYNC(동기화 보정용 로그)는 중복처럼 보이므로 UI에서 기본 제외
-  const tableSource = tl.filter(t => (t.reason || '') !== 'UPBIT_SYNC');
+  // 모든 거래 로그 표시 (UPBIT_SYNC 동기화 내역 포함)
+  const tableSource = tl;
 
   // 중복 체결(동일 시각/종목/방향/가격/수량) 제거
   const deduped = [];
