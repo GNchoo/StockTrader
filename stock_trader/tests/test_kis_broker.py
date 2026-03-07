@@ -39,6 +39,7 @@ class TestKISBroker(unittest.TestCase):
 
         class R:
             ok = True
+            status_code = 200
             text = "{}"
 
             def json(self):
@@ -62,6 +63,7 @@ class TestKISBroker(unittest.TestCase):
 
         class R:
             ok = True
+            status_code = 200
             text = "{}"
 
             def json(self):
@@ -85,6 +87,7 @@ class TestKISBroker(unittest.TestCase):
 
         class R:
             ok = True
+            status_code = 200
             text = "{}"
 
             def json(self):
@@ -102,6 +105,7 @@ class TestKISBroker(unittest.TestCase):
 
         class R:
             ok = True
+            status_code = 200
             text = "{}"
 
             def json(self):

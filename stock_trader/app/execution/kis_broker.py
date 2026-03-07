@@ -1,12 +1,18 @@
 import json
+import time
+import logging
 from dataclasses import dataclass
 from typing import Any
 from datetime import datetime
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .broker_base import BrokerBase, OrderRequest, OrderResult
 from app.config import settings
+
+_log = logging.getLogger("stock_trader.kis")
 
 
 class KISBrokerError(RuntimeError):
@@ -20,8 +26,23 @@ class KISToken:
     expires_at: float = 0.0  # Unix timestamp
 
 
+def _build_session() -> requests.Session:
+    """재시도 + keep-alive 설정된 Session 생성."""
+    s = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=2, pool_maxsize=5)
+    s.mount("https://", adapter)
+    return s
+
+
 class KISBroker(BrokerBase):
     TOKEN_REFRESH_MARGIN_SEC = 300  # 만료 5분 전에 갱신
+    MAX_TOKEN_RETRIES = 2  # 401 시 토큰 재발급 후 재시도 횟수
 
     @staticmethod
     def _to_float(v: Any) -> float:
@@ -57,7 +78,7 @@ class KISBroker(BrokerBase):
                 else "https://openapi.koreainvestment.com:9443"
             )
         self.mode = mode
-        self.session = requests.Session()
+        self.session = _build_session()
         self._token: KISToken | None = None
 
     def _split_account(self) -> tuple[str, str]:
@@ -109,11 +130,57 @@ class KISBroker(BrokerBase):
         return self._token
 
     def _auth_header(self) -> dict[str, str]:
-        import time
         tok = self._token
         if tok is None or time.time() >= tok.expires_at - self.TOKEN_REFRESH_MARGIN_SEC:
             tok = self._issue_token()
         return {"authorization": f"Bearer {tok.access_token}"}
+
+    def _invalidate_token(self) -> None:
+        """토큰을 무효화하여 다음 요청 시 재발급."""
+        self._token = None
+
+    def _request_with_auth_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict | None = None,
+        params: dict | None = None,
+        json_body: dict | None = None,
+        timeout: int = 10,
+    ) -> requests.Response:
+        """401 응답 시 토큰 재발급 후 자동 재시도.
+
+        네트워크 에러는 Session의 Retry 어댑터가 처리.
+        """
+        for attempt in range(self.MAX_TOKEN_RETRIES + 1):
+            auth = self._auth_header()
+            merged_headers = {
+                **(headers or {}),
+                **auth,
+                "appkey": settings.kis_app_key,
+                "appsecret": settings.kis_app_secret,
+                "custtype": "P",
+            }
+            try:
+                if method.upper() == "POST":
+                    r = self.session.post(url, headers=merged_headers, json=json_body, timeout=timeout)
+                else:
+                    r = self.session.get(url, headers=merged_headers, params=params, timeout=timeout)
+
+                if r.status_code == 401 and attempt < self.MAX_TOKEN_RETRIES:
+                    _log.warning("KIS 401 — 토큰 재발급 시도 (%d/%d)", attempt + 1, self.MAX_TOKEN_RETRIES)
+                    self._invalidate_token()
+                    time.sleep(0.5)
+                    continue
+                return r
+            except requests.exceptions.ConnectionError as e:
+                if attempt < self.MAX_TOKEN_RETRIES:
+                    _log.warning("KIS 연결 오류 — 재시도 (%d/%d): %s", attempt + 1, self.MAX_TOKEN_RETRIES, e)
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                raise KISBrokerError(f"KIS connection failed after retries: {e}") from e
+        raise KISBrokerError("KIS request failed: max retries exceeded")
 
     def _tr_id_order(self, side: str) -> str:
         s = (side or "").upper()
@@ -136,15 +203,12 @@ class KISBroker(BrokerBase):
             "ORD_QTY": str(qty),
             "ORD_UNPR": "0",
         }
-        headers = {
-            **self._auth_header(),
-            "appkey": settings.kis_app_key,
-            "appsecret": settings.kis_app_secret,
-            "tr_id": tr_id,
-            "custtype": "P",
-            "content-type": "application/json; charset=utf-8",
-        }
-        r = self.session.post(url, headers=headers, json=body, timeout=8)
+        r = self._request_with_auth_retry(
+            "POST", url,
+            headers={"tr_id": tr_id, "content-type": "application/json; charset=utf-8"},
+            json_body=body,
+            timeout=10,
+        )
         if not r.ok:
             raise KISBrokerError(f"order failed: HTTP {r.status_code} {r.text[:200]}")
         return r.json()
@@ -197,16 +261,14 @@ class KISBroker(BrokerBase):
             "INQR_DVSN_3": "00",
             "INQR_DVSN_1": "",
         }
-        headers = {
-            **self._auth_header(),
-            "appkey": settings.kis_app_key,
-            "appsecret": settings.kis_app_secret,
-            "tr_id": "VTTC8001R" if self.mode == "paper" else "TTTC8001R",
-            "custtype": "P",
-        }
 
         try:
-            r = self.session.get(url, headers=headers, params=params, timeout=8)
+            r = self._request_with_auth_retry(
+                "GET", url,
+                headers={"tr_id": "VTTC8001R" if self.mode == "paper" else "TTTC8001R"},
+                params=params,
+                timeout=10,
+            )
             if not r.ok:
                 return None
             data = r.json() if r.text else {}
@@ -255,16 +317,14 @@ class KISBroker(BrokerBase):
     def get_last_price(self, ticker: str) -> float | None:
         """현재가 조회 (국내주식 현재가 시세)."""
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
-        headers = {
-            **self._auth_header(),
-            "appkey": settings.kis_app_key,
-            "appsecret": settings.kis_app_secret,
-            "tr_id": "FHKST01010100",
-            "custtype": "P",
-        }
         params = {"fid_cond_mrkt_div_code": "J", "fid_input_iscd": str(ticker)}
         try:
-            r = self.session.get(url, headers=headers, params=params, timeout=5)
+            r = self._request_with_auth_retry(
+                "GET", url,
+                headers={"tr_id": "FHKST01010100"},
+                params=params,
+                timeout=8,
+            )
             if not r.ok:
                 return None
             data = r.json() if r.text else {}
@@ -277,25 +337,22 @@ class KISBroker(BrokerBase):
     def get_recent_closes(self, ticker: str, count: int = 30) -> list[float] | None:
         """KIS API를 통해 과거 일봉 종가 배열을 반환 (오래된 순)."""
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-price"
-        headers = {
-            **self._auth_header(),
-            "appkey": settings.kis_app_key,
-            "appsecret": settings.kis_app_secret,
-            "tr_id": "FHKST01010400",  # 국내주식 기간별시세(일/주/월/년)
-            "custtype": "P",
-        }
-        today = datetime.now().strftime("%Y%m%d")
         
         # 참고: KIS API는 최신 데이터부터 내림차순으로 반환
         params = {
             "FID_COND_MRKT_DIV_CODE": "J",
             "FID_INPUT_ISCD": str(ticker),
             "FID_PERIOD_DIV_CODE": "D",
-            "FID_ORG_ADJ_PRC": "0" # 수정주가 반영 여부 (0:미반영, 1:반영) -> 분석에는 1이 좋으나, 기본값 유지
+            "FID_ORG_ADJ_PRC": "0",
         }
         
         try:
-            r = self.session.get(url, headers=headers, params=params, timeout=5)
+            r = self._request_with_auth_retry(
+                "GET", url,
+                headers={"tr_id": "FHKST01010400"},
+                params=params,
+                timeout=8,
+            )
             if not r.ok:
                 return None
             data = r.json() if r.text else {}
