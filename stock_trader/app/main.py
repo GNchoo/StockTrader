@@ -18,7 +18,7 @@ class SignalBundle(TypedDict):
     ticker: str
 
 
-ExecStatus = Literal["FILLED", "PENDING", "BLOCKED"]
+from app.execution.sync_logic import sync_entry_order_once, sync_exit_order_once, ExecStatus
 
 
 def _build_broker():
