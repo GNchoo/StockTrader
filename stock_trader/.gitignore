@@ -4,3 +4,8 @@ __pycache__/
 .env
 .env.*
 !.env.example
+*.log
+.pytest_cache/
+stock_trader_daemon.log
+stock_trader_dashboard.log
+stock_trader.log

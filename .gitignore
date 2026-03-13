@@ -2,5 +2,9 @@ __pycache__/
 *.pyc
 .env
 .env.*
+!.env.example
 *.log
+*.db
+.pytest_cache/
 stock_trader/trader_env/
+scripts/push_stocktrader_only.sh
